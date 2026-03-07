@@ -1,10 +1,12 @@
 /**
  * DTC Automation Script
- * Version: 3.5.0 (Night Shift Logic)
- * Last Updated: 31/01/2026
+ * Version: 3.6.0 (Night Shift + Retry Search Loop)
+ * Last Updated: 07/03/2026
  * Changes:
  * - Update Time Logic: Yesterday 18:00 to Today 06:00
  * - Fix Email Subject date display
+ * - Add validation function `checkValidLicense` to detect valid license plates
+ * - Implement max 3 retries for Search -> Export if license plate has no numbers
  */
 
 const puppeteer = require('puppeteer');
@@ -114,6 +116,43 @@ async function convertToCsv(sourcePath, destPath) {
         }
     } catch (e) {
         console.warn(`   ⚠️ CSV Conversion error: ${e.message}`);
+    }
+}
+
+// 3. ฟังก์ชันตรวจสอบคอลัมน์ทะเบียนรถว่ามีตัวเลขหรือไม่
+function checkValidLicense(filePath, colLicenseIndex) {
+    try {
+        if (!fs.existsSync(filePath)) return false;
+        const fileContent = fs.readFileSync(filePath, 'utf8');
+        const rows = parse(fileContent, {
+            columns: false,
+            skip_empty_lines: true,
+            relax_column_count: true,
+            bom: true
+        });
+
+        let headerIndex = -1;
+        for (let i = 0; i < Math.min(rows.length, 20); i++) {
+            if (rows[i].some(cell => String(cell).includes('ลำดับ'))) {
+                headerIndex = i;
+                break;
+            }
+        }
+
+        if (headerIndex === -1) return false;
+
+        const dataRows = rows.slice(headerIndex + 1);
+        for (const row of dataRows) {
+            const license = row[colLicenseIndex] ? String(row[colLicenseIndex]).trim() : '';
+            // ตรวจสอบว่ามีตัวเลขอยู่ในทะเบียนรถหรือไม่ (ใช้ Regular expression \d)
+            if (license && /\d/.test(license)) {
+                return true; 
+            }
+        }
+        return false; 
+    } catch (err) {
+        console.warn(`   ⚠️ Validation error for ${path.basename(filePath)}:`, err.message);
+        return false;
     }
 }
 
@@ -263,7 +302,7 @@ function zipFiles(sourceDir, outPath, filesToZip) {
     if (fs.existsSync(downloadPath)) fs.rmSync(downloadPath, { recursive: true, force: true });
     fs.mkdirSync(downloadPath);
 
-    console.log('🚀 Starting DTC Automation V3.5 (Night Shift 18:00 - 06:00)...');
+    console.log('🚀 Starting DTC Automation V3.6 (Night Shift 18:00 - 06:00 With Search Retry Loop)...');
     
     const browser = await puppeteer.launch({
         headless: true,
@@ -330,19 +369,36 @@ function zipFiles(sourceDir, outPath, filesToZip) {
             selectElement.dispatchEvent(new Event('change', { bubbles: true }));
         }, startDateTime, endDateTime);
 
-        console.log('   Searching Report 1...');
-        await page.evaluate(() => {
-            if(typeof sertch_data === 'function') sertch_data();
-            else document.querySelector("span[onclick='sertch_data();']").click();
-        });
+        let file1 = '';
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            console.log(`   Searching Report 1 (Attempt ${attempt}/3)...`);
+            await page.evaluate(() => {
+                if(typeof sertch_data === 'function') sertch_data();
+                else document.querySelector("span[onclick='sertch_data();']").click();
+            });
 
-        console.log('   ⏳ Waiting 5 mins...');
-        await new Promise(resolve => setTimeout(resolve, 300000));
-        
-        try { await page.waitForSelector('#btnexport', { visible: true, timeout: 60000 }); } catch(e) {}
-        console.log('   Exporting Report 1...');
-        await page.evaluate(() => document.getElementById('btnexport').click());
-        const file1 = await waitForDownloadAndRename(downloadPath, 'Report1_OverSpeed.xls');
+            console.log('   ⏳ Waiting 5 mins...');
+            await new Promise(resolve => setTimeout(resolve, 300000));
+            
+            try { await page.waitForSelector('#btnexport', { visible: true, timeout: 60000 }); } catch(e) {}
+            console.log('   Exporting Report 1...');
+            await page.evaluate(() => {
+                const btn = document.getElementById('btnexport');
+                if (btn) btn.click();
+            });
+            
+            try {
+                file1 = await waitForDownloadAndRename(downloadPath, 'Report1_OverSpeed.xls');
+                if (checkValidLicense(file1, 1)) {
+                    console.log(`   ✅ Valid license data found in Attempt ${attempt}.`);
+                    break;
+                } else {
+                    console.warn(`   ⚠️ No valid license data found in Attempt ${attempt}. Retrying...`);
+                }
+            } catch (err) {
+                console.warn(`   ⚠️ Download failed in Attempt ${attempt}: ${err.message}. Retrying...`);
+            }
+        }
 
         // REPORT 2: Idling
         console.log('📊 Processing Report 2: Idling...');
@@ -360,11 +416,30 @@ function zipFiles(sourceDir, outPath, filesToZip) {
             if (select) { for (let opt of select.options) { if (opt.text.includes('ทั้งหมด')) { select.value = opt.value; break; } } select.dispatchEvent(new Event('change', { bubbles: true })); }
         }, startDateTime, endDateTime);
         
-        await page.click('td:nth-of-type(6) > span');
-        console.log('   ⏳ Waiting 4.5 mins (Strict)...');
-        await new Promise(r => setTimeout(r, 270000));
-        await page.evaluate(() => document.getElementById('btnexport').click());
-        const file2 = await waitForDownloadAndRename(downloadPath, 'Report2_Idling.xls');
+        let file2 = '';
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            console.log(`   Searching Report 2 (Attempt ${attempt}/3)...`);
+            await page.click('td:nth-of-type(6) > span');
+            console.log('   ⏳ Waiting 3 mins (Strict)...');
+            await new Promise(r => setTimeout(r, 180000));
+            
+            await page.evaluate(() => {
+                const btn = document.getElementById('btnexport');
+                if (btn) btn.click();
+            });
+
+            try {
+                file2 = await waitForDownloadAndRename(downloadPath, 'Report2_Idling.xls');
+                if (checkValidLicense(file2, 1)) {
+                    console.log(`   ✅ Valid license data found in Attempt ${attempt}.`);
+                    break;
+                } else {
+                    console.warn(`   ⚠️ No valid license data found in Attempt ${attempt}. Retrying...`);
+                }
+            } catch (err) {
+                console.warn(`   ⚠️ Download failed in Attempt ${attempt}: ${err.message}. Retrying...`);
+            }
+        }
 
         // REPORT 3: Sudden Brake
         console.log('📊 Processing Report 3: Sudden Brake...');
@@ -379,19 +454,36 @@ function zipFiles(sourceDir, outPath, filesToZip) {
             var select = document.getElementById('ddl_truck'); 
             if (select) { for (let opt of select.options) { if (opt.text.includes('ทั้งหมด')) { select.value = opt.value; break; } } select.dispatchEvent(new Event('change', { bubbles: true })); }
         }, startDateTime, endDateTime);
-        await page.click('td:nth-of-type(6) > span');
-        console.log('   ⏳ Waiting 3 mins (Strict)...'); 
-        await new Promise(r => setTimeout(r, 180000)); 
-        await page.evaluate(() => {
-            const btns = Array.from(document.querySelectorAll('button'));
-            const b = btns.find(b => b.innerText.includes('Excel') || b.title === 'Excel');
-            if (b) b.click(); else document.querySelector('#table button:nth-of-type(3)')?.click();
-        });
-        const file3 = await waitForDownloadAndRename(downloadPath, 'Report3_SuddenBrake.xls');
+        
+        let file3 = '';
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            console.log(`   Searching Report 3 (Attempt ${attempt}/3)...`);
+            await page.click('td:nth-of-type(6) > span');
+            console.log('   ⏳ Waiting 3 mins (Strict)...'); 
+            await new Promise(r => setTimeout(r, 180000)); 
+            
+            await page.evaluate(() => {
+                const btns = Array.from(document.querySelectorAll('button'));
+                const b = btns.find(b => b.innerText.includes('Excel') || b.title === 'Excel');
+                if (b) b.click(); else document.querySelector('#table button:nth-of-type(3)')?.click();
+            });
+
+            try {
+                file3 = await waitForDownloadAndRename(downloadPath, 'Report3_SuddenBrake.xls');
+                if (checkValidLicense(file3, 1)) {
+                    console.log(`   ✅ Valid license data found in Attempt ${attempt}.`);
+                    break;
+                } else {
+                    console.warn(`   ⚠️ No valid license data found in Attempt ${attempt}. Retrying...`);
+                }
+            } catch (err) {
+                console.warn(`   ⚠️ Download failed in Attempt ${attempt}: ${err.message}. Retrying...`);
+            }
+        }
 
         // REPORT 4: Harsh Start
         console.log('📊 Processing Report 4: Harsh Start...');
-        let file4 = ''; // Fix Scope Issue: Declare variable outside try block
+        let file4 = ''; 
         try {
             await page.goto('https://gps.dtc.co.th/ultimate/Report/report_ha.php', { waitUntil: 'domcontentloaded' });
             await page.waitForSelector('#date9', { visible: true, timeout: 60000 });
@@ -414,22 +506,38 @@ function zipFiles(sourceDir, outPath, filesToZip) {
                     if (typeof $ !== 'undefined' && $(select).data('select2')) { $(select).trigger('change'); }
                 }
             }, startDateTime, endDateTime);
-            await page.evaluate(() => {
-                if (typeof sertch_data === 'function') { sertch_data(); } else { document.querySelector('td:nth-of-type(6) > span').click(); }
-            });
-            console.log('   ⏳ Waiting 4 mins (Strict)...');
-            await new Promise(r => setTimeout(r, 240000));
-            await page.evaluate(() => {
-                const xpathResult = document.evaluate('//*[@id="table"]/div[1]/button[3]', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-                const btn = xpathResult.singleNodeValue;
-                if (btn) btn.click();
-                else {
-                    const allBtns = Array.from(document.querySelectorAll('button'));
-                    const excelBtn = allBtns.find(b => b.innerText.includes('Excel') || b.title === 'Excel');
-                    if (excelBtn) excelBtn.click(); else throw new Error("Cannot find Export button for Report 4");
+            
+            for (let attempt = 1; attempt <= 3; attempt++) {
+                console.log(`   Searching Report 4 (Attempt ${attempt}/3)...`);
+                await page.evaluate(() => {
+                    if (typeof sertch_data === 'function') { sertch_data(); } else { document.querySelector('td:nth-of-type(6) > span').click(); }
+                });
+                console.log('   ⏳ Waiting 3 mins (Strict)...');
+                await new Promise(r => setTimeout(r, 180000));
+                
+                await page.evaluate(() => {
+                    const xpathResult = document.evaluate('//*[@id="table"]/div[1]/button[3]', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+                    const btn = xpathResult.singleNodeValue;
+                    if (btn) btn.click();
+                    else {
+                        const allBtns = Array.from(document.querySelectorAll('button'));
+                        const excelBtn = allBtns.find(b => b.innerText.includes('Excel') || b.title === 'Excel');
+                        if (excelBtn) excelBtn.click(); else throw new Error("Cannot find Export button for Report 4");
+                    }
+                });
+                
+                try {
+                    file4 = await waitForDownloadAndRename(downloadPath, 'Report4_HarshStart.xls');
+                    if (checkValidLicense(file4, 1)) {
+                        console.log(`   ✅ Valid license data found in Attempt ${attempt}.`);
+                        break;
+                    } else {
+                        console.warn(`   ⚠️ No valid license data found in Attempt ${attempt}. Retrying...`);
+                    }
+                } catch (err) {
+                    console.warn(`   ⚠️ Download failed in Attempt ${attempt}: ${err.message}. Retrying...`);
                 }
-            });
-            file4 = await waitForDownloadAndRename(downloadPath, 'Report4_HarshStart.xls');
+            }
         } catch (error) {
             console.error('❌ Report 4 Failed:', error.message);
         }
@@ -463,24 +571,44 @@ function zipFiles(sourceDir, outPath, filesToZip) {
             var allSelects = document.getElementsByTagName('select');
             for(var s of allSelects) { for(var i=0; i<s.options.length; i++) { if(s.options[i].text.includes('สถานีทั้งหมด')) { s.value = s.options[i].value; s.dispatchEvent(new Event('change', { bubbles: true })); break; } } }
         });
-        await page.click('td:nth-of-type(7) > span');
-        console.log('   ⏳ Waiting 5 mins (Strict)...');
-        await new Promise(r => setTimeout(r, 300000));
-        try { await page.waitForSelector('#btnexport', { visible: true, timeout: 60000 }); } catch(e) {}
-        await page.evaluate(() => document.getElementById('btnexport').click());
-        const file5 = await waitForDownloadAndRename(downloadPath, 'Report5_ForbiddenParking.xls');
+        
+        let file5 = '';
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            console.log(`   Searching Report 5 (Attempt ${attempt}/3)...`);
+            await page.click('td:nth-of-type(7) > span');
+            console.log('   ⏳ Waiting 3 mins (Strict)...');
+            await new Promise(r => setTimeout(r, 180000));
+            try { await page.waitForSelector('#btnexport', { visible: true, timeout: 60000 }); } catch(e) {}
+            
+            await page.evaluate(() => {
+                const btn = document.getElementById('btnexport');
+                if (btn) btn.click();
+            });
+            
+            try {
+                file5 = await waitForDownloadAndRename(downloadPath, 'Report5_ForbiddenParking.xls');
+                if (checkValidLicense(file5, 2)) { // Report 5 License Plate is in Column index 2
+                    console.log(`   ✅ Valid license data found in Attempt ${attempt}.`);
+                    break;
+                } else {
+                    console.warn(`   ⚠️ No valid license data found in Attempt ${attempt}. Retrying...`);
+                }
+            } catch (err) {
+                console.warn(`   ⚠️ Download failed in Attempt ${attempt}: ${err.message}. Retrying...`);
+            }
+        }
 
         // =================================================================
         // STEP 7: Generate PDF Summary (REVISED V3.4)
         // =================================================================
-        console.log('📑 Step 7: Generating PDF Summary (Revised V3.4)...');
+        console.log('📑 Step 7: Generating PDF Summary (Revised V3.6)...');
 
         const FILES_CSV = {
-            OVERSPEED: file1,
-            IDLING: file2,
-            SUDDEN_BRAKE: file3,
-            HARSH_START: file4 !== '' ? file4 : '', // Check outer variable
-            PROHIBITED: file5
+            OVERSPEED: file1 || '',
+            IDLING: file2 || '',
+            SUDDEN_BRAKE: file3 || '',
+            HARSH_START: file4 || '', 
+            PROHIBITED: file5 || ''
         };
 
         // 1. Process Report 1: Over Speed
@@ -528,7 +656,7 @@ function zipFiles(sourceDir, outPath, filesToZip) {
             colSpeedEnd: 5
         }) : [];
 
-        const rawStart = (FILES_CSV.HARSH_START && fs.existsSync(FILES_CSV.HARSH_START)) ? processCSV_V3(FILES_CSV.HARSH_START, {
+        const rawStart = fs.existsSync(FILES_CSV.HARSH_START) ? processCSV_V3(FILES_CSV.HARSH_START, {
             colLicense: 1,
             colDate: 3,
             colSpeedStart: 4,
