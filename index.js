@@ -1,12 +1,11 @@
 /**
  * DTC Automation Script
- * Version: 3.6.0 (Night Shift + Retry Search Loop)
- * Last Updated: 07/03/2026
+ * Version: 3.7.0 (Night Shift + Retry Search + Fix Report 5 J Column)
+ * Last Updated: 08/05/2026
  * Changes:
  * - Update Time Logic: Yesterday 18:00 to Today 06:00
- * - Fix Email Subject date display
- * - Add validation function `checkValidLicense` to detect valid license plates
- * - Implement max 3 retries for Search -> Export if license plate has no numbers
+ * - Add validation function `checkValidLicense` to detect valid license plates (Max 3 Retries)
+ * - FIX Report 5: Calculate total duration directly from Column J instead of Exit-Enter time
  */
 
 const puppeteer = require('puppeteer');
@@ -144,7 +143,6 @@ function checkValidLicense(filePath, colLicenseIndex) {
         const dataRows = rows.slice(headerIndex + 1);
         for (const row of dataRows) {
             const license = row[colLicenseIndex] ? String(row[colLicenseIndex]).trim() : '';
-            // ตรวจสอบว่ามีตัวเลขอยู่ในทะเบียนรถหรือไม่ (ใช้ Regular expression \d)
             if (license && /\d/.test(license)) {
                 return true; 
             }
@@ -159,24 +157,16 @@ function checkValidLicense(filePath, colLicenseIndex) {
 // --- Helper: Parse Date (Supports DD/MM/YYYY and YYYY-MM-DD) ---
 function parseDateTimeToSeconds(dateStr) {
     if (!dateStr) return 0;
-    
-    // Split by space, slash, colon, or dash
     const parts = dateStr.split(/[ /:-]/);
-    
-    // Must have at least Date parts (3) + Time parts (3) = 6
     if (parts.length < 6) return 0;
     
     let day, month, year, hour, minute, second;
 
-    // Detect format based on first part length
-    // YYYY-MM-DD (Report 5)
     if (parts[0].length === 4) {
         year = parseInt(parts[0]);
-        month = parseInt(parts[1]) - 1; // JS Month is 0-11
+        month = parseInt(parts[1]) - 1; 
         day = parseInt(parts[2]);
-    } 
-    // DD/MM/YYYY (Reports 1-4)
-    else {
+    } else {
         day = parseInt(parts[0]);
         month = parseInt(parts[1]) - 1;
         year = parseInt(parts[2]);
@@ -190,6 +180,28 @@ function parseDateTimeToSeconds(dateStr) {
     return date.getTime() / 1000;
 }
 
+// --- Helper: Parse Duration String (HH:MM:SS) to Seconds ---
+function parseDurationToSeconds(str) {
+    if (!str) return 0;
+    // รองรับรูปแบบ "1 วัน 02:30:00" หรือ "02:30:00"
+    const match = String(str).match(/(?:(\d+)\s*วัน\s*)?(\d{1,2}):(\d{1,2}):(\d{1,2})/);
+    if (match) {
+        const days = parseInt(match[1] || 0);
+        const hours = parseInt(match[2] || 0);
+        const mins = parseInt(match[3] || 0);
+        const secs = parseInt(match[4] || 0);
+        return (days * 86400) + (hours * 3600) + (mins * 60) + secs;
+    }
+    // สำรองกรณีเป็นแค่นาทีและวินาที MM:SS หรือ HH:MM:SS ทั่วไป
+    const parts = String(str).trim().split(':');
+    if (parts.length === 3) {
+        return parseInt(parts[0] || 0) * 3600 + parseInt(parts[1] || 0) * 60 + parseInt(parts[2] || 0);
+    } else if (parts.length === 2) {
+        return parseInt(parts[0] || 0) * 60 + parseInt(parts[1] || 0);
+    }
+    return 0;
+}
+
 // --- Helper: Format Seconds to HH:MM:SS ---
 function formatSeconds(totalSeconds) {
     if (isNaN(totalSeconds)) return "00:00:00";
@@ -199,7 +211,7 @@ function formatSeconds(totalSeconds) {
     return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
 }
 
-// --- FUNCTION: Process CSV V3 (FIXED) ---
+// --- FUNCTION: Process CSV V3 ---
 function processCSV_V3(filePath, config) {
     try {
         if (!fs.existsSync(filePath)) {
@@ -215,7 +227,6 @@ function processCSV_V3(filePath, config) {
             bom: true
         });
 
-        // 1. Find Header Row (Search for "ลำดับ")
         let headerIndex = -1;
         for (let i = 0; i < Math.min(rows.length, 20); i++) {
             if (rows[i].some(cell => cell.includes('ลำดับ'))) {
@@ -229,27 +240,28 @@ function processCSV_V3(filePath, config) {
             return [];
         }
 
-        // 2. Process Data Rows
         const dataRows = rows.slice(headerIndex + 1);
         const results = [];
 
         dataRows.forEach(row => {
-            // Get License Plate from configured column
             const license = row[config.colLicense] ? row[config.colLicense].trim() : '';
 
-            // Filter: Must contain "-" (To exclude footer sums/headers)
             if (license && license.includes('-')) {
                 const item = { license };
 
-                // Calculate Time: (End - Start)
-                if (config.useTimeCalc && config.colStart !== undefined && config.colEnd !== undefined) {
+                // หากระบุคอลัมน์ Duration มา (เช่นคอลัมน์ J) ให้ใช้จากคอลัมน์นี้โดยตรง
+                if (config.colDuration !== undefined) {
+                    item.durationSec = parseDurationToSeconds(row[config.colDuration]);
+                    item.durationStr = formatSeconds(item.durationSec);
+                } 
+                // หรือถ้าเป็นการลบเวลาปกติ
+                else if (config.useTimeCalc && config.colStart !== undefined && config.colEnd !== undefined) {
                     const t1 = parseDateTimeToSeconds(row[config.colStart]); 
                     const t2 = parseDateTimeToSeconds(row[config.colEnd]);   
                     item.durationSec = (t2 > t1) ? (t2 - t1) : 0;
                     item.durationStr = formatSeconds(item.durationSec);
                 }
                 
-                // Other fields
                 if (config.colDate !== undefined) item.date = row[config.colDate];
                 if (config.colStation !== undefined) item.station = row[config.colStation];
                 if (config.colSpeedStart !== undefined) item.v_start = row[config.colSpeedStart];
@@ -268,12 +280,10 @@ function processCSV_V3(filePath, config) {
 }
 
 // --- Helper: Get Formatted Date with Offset ---
-// Offset 0 = Today, -1 = Yesterday
 function getFormattedDate(offsetDays = 0) {
     const date = new Date();
     date.setDate(date.getDate() + offsetDays);
     const options = { year: 'numeric', month: '2-digit', day: '2-digit', timeZone: 'Asia/Bangkok' };
-    // en-CA gives YYYY-MM-DD
     return new Intl.DateTimeFormat('en-CA', options).format(date);
 }
 
@@ -302,7 +312,7 @@ function zipFiles(sourceDir, outPath, filesToZip) {
     if (fs.existsSync(downloadPath)) fs.rmSync(downloadPath, { recursive: true, force: true });
     fs.mkdirSync(downloadPath);
 
-    console.log('🚀 Starting DTC Automation V3.6 (Night Shift 18:00 - 06:00 With Search Retry Loop)...');
+    console.log('🚀 Starting DTC Automation V3.7 (Night Shift 18:00 - 06:00 With Search Retry Loop)...');
     
     const browser = await puppeteer.launch({
         headless: true,
@@ -333,9 +343,8 @@ function zipFiles(sourceDir, outPath, filesToZip) {
         console.log('✅ Login Success');
 
         // --- TIME CALCULATION FOR NIGHT SHIFT ---
-        // Yesterday 18:00 to Today 06:00
-        const yesterdayStr = getFormattedDate(-1); // YYYY-MM-DD (Yesterday)
-        const todayStr = getFormattedDate(0);      // YYYY-MM-DD (Today)
+        const yesterdayStr = getFormattedDate(-1); 
+        const todayStr = getFormattedDate(0);      
         
         const startDateTime = `${yesterdayStr} 18:00`;
         const endDateTime = `${todayStr} 06:00`;
@@ -599,9 +608,9 @@ function zipFiles(sourceDir, outPath, filesToZip) {
         }
 
         // =================================================================
-        // STEP 7: Generate PDF Summary (REVISED V3.4)
+        // STEP 7: Generate PDF Summary
         // =================================================================
-        console.log('📑 Step 7: Generating PDF Summary (Revised V3.6)...');
+        console.log('📑 Step 7: Generating PDF Summary (Revised V3.7)...');
 
         const FILES_CSV = {
             OVERSPEED: file1 || '',
@@ -611,8 +620,6 @@ function zipFiles(sourceDir, outPath, filesToZip) {
             PROHIBITED: file5 || ''
         };
 
-        // 1. Process Report 1: Over Speed
-        // Logic: License=Col B(1), Start=Col C(2), End=Col D(3). Calc: D-C.
         const rawSpeed = processCSV_V3(FILES_CSV.OVERSPEED, { 
             colLicense: 1, 
             colStart: 2, 
@@ -629,8 +636,6 @@ function zipFiles(sourceDir, outPath, filesToZip) {
         const topSpeed = Object.values(speedStats).sort((a, b) => b.time - a.time).slice(0, 10);
         const totalOverSpeed = rawSpeed.length;
 
-        // 2. Process Report 2: Idling
-        // Logic: License=Col B(1), Start=Col C(2), End=Col D(3). Calc: D-C.
         const rawIdling = processCSV_V3(FILES_CSV.IDLING, { 
             colLicense: 1, 
             colStart: 2, 
@@ -647,8 +652,6 @@ function zipFiles(sourceDir, outPath, filesToZip) {
         const topIdle = Object.values(idleStats).sort((a, b) => b.time - a.time).slice(0, 10);
         const maxIdleCar = topIdle.length > 0 ? topIdle[0] : { time: 0, license: '-' };
 
-        // 3. Process Report 3 & 4 (Events)
-        // Logic: License=Col B(1). Date=Col D(3). Speed Start=Col E(4). Speed End=Col F(5).
         const rawBrake = fs.existsSync(FILES_CSV.SUDDEN_BRAKE) ? processCSV_V3(FILES_CSV.SUDDEN_BRAKE, {
             colLicense: 1,
             colDate: 3,
@@ -664,19 +667,16 @@ function zipFiles(sourceDir, outPath, filesToZip) {
         }) : [];
         
         const criticalEvents = [
-            ...rawBrake.map(r => ({ ...r, type: 'Sudden Brake', level: r.date })), // Use Date as Level field
+            ...rawBrake.map(r => ({ ...r, type: 'Sudden Brake', level: r.date })), 
             ...rawStart.map(r => ({ ...r, type: 'Harsh Start', level: r.date }))
         ];
 
-        // 4. Process Report 5: Prohibited
-        // Logic: License=Col C(2), Station=Col E(4), Enter=Col F(5), Exit=Col G(6). 
-        // Use Calc: Exit - Enter (to get seconds precision)
+        // 4. Process Report 5: Prohibited (Use Column J instead of Exit-Enter)
+        // Logic: License=Col C(2), Station=Col E(4), Duration=Col J(9)
         const rawForbidden = processCSV_V3(FILES_CSV.PROHIBITED, {
             colLicense: 2,
             colStation: 4,
-            colStart: 5,  // Enter Time
-            colEnd: 6,    // Exit Time
-            useTimeCalc: true
+            colDuration: 9 // ชี้ให้ไปดึงข้อมูลเวลาจากคอลัมน์ J (Index 9)
         });
 
         const forbiddenList = rawForbidden
@@ -695,7 +695,6 @@ function zipFiles(sourceDir, outPath, filesToZip) {
             .sort((a, b) => b.time - a.time).slice(0, 5);
 
         // --- HTML GENERATION ---
-        // Display Date in PDF (Shows the range or just Today)
         const reportDateDisplay = `${yesterdayStr} 18:00 - ${todayStr} 06:00`;
         
         const html = `
